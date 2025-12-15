@@ -8,7 +8,7 @@ A lightweight **error-based SQLi heuristic scanner** that looks for **500 → no
 - URL / URL list scanning
 - Form + **auto-detected JSON** bodies (no `-json` needed)
 - Cookie-only mode
-- Full mode (params + cookies + header probes)
+- Full mode (params + cookies + UserAgent + Referer + X-Forwarded-For)
 
 > ⚠️ This tool is **heuristic**. “500 on `'` and non-500 on `''`” can strongly suggest SQL parsing, but **is not 100% proof** of SQLi.
 
