@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SQL Injection Detection Tool - Full Featured (curl-based)
+Super Simple SQL Injection Detection Tool - Full Featured (curl-based)
 Detects error-based SQLi hints using 500 -> non-500 status transitions
 
 Features:

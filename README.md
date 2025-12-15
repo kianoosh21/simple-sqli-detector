@@ -1,4 +1,4 @@
-# SQLi Error-Heuristic Scanner (Burp Raw / curl) — `simple-sqli-detector.py`
+# Simple SQLi Error-Heuristic Scanner (Burp Raw / curl) — `simple-sqli-detector.py`
 
 A lightweight **error-based SQLi heuristic scanner** that looks for **500 → non-500** transitions after appending `'` and then `''` to inputs.
 
@@ -17,7 +17,7 @@ A lightweight **error-based SQLi heuristic scanner** that looks for **500 → no
 ## Features
 
 - **Modes**
-  - `single` (default): tests params one by one
+  - `-sr / --singleRecursive` (default): tests params one by one recursively
   - `-faster`: batch test, falls back to single mode if 500 occurs
   - `-fastest`: minimal requests, falls back to identify param(s)
 
@@ -36,7 +36,7 @@ A lightweight **error-based SQLi heuristic scanner** that looks for **500 → no
 
 ## Install
 
-Requires: `python3` + `curl`
+Requires: `python3` + `curl to be already installed on your system`
 
 chmod +x test.py
 
@@ -101,3 +101,7 @@ Use **only on systems you own or have explicit permission to test**.
 No responsibility for misuse.
 
 ---
+
+## Screenshot (`-h` output)
+
+![test.py -h output](help.png)
