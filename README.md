@@ -1,4 +1,4 @@
-# SQLi Error-Heuristic Scanner (Burp Raw / curl) — `test.py`
+# SQLi Error-Heuristic Scanner (Burp Raw / curl) — `simple-sqli-detector.py`
 
 A lightweight **error-based SQLi heuristic scanner** that looks for **500 → non-500** transitions after appending `'` and then `''` to inputs.
 
