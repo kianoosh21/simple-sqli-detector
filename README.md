@@ -53,7 +53,8 @@ chmod +x simple-sqli-detector.py
 
 2) Scan multiple Burp requests in a single file:
 
-`python3 simple-sqli-scanner.py -r multi-requests.txt (multiple Raw burp copy/pasted input - should be placed after 2 empty lines each)`
+`python3 simple-sqli-scanner.py -r multi-requests.txt` 
+(multiple Raw burp copy/pasted input - should be placed after 2 empty lines each)
 
 3) Cookie-only scanning:
 
