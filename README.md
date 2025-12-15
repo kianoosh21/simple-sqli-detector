@@ -67,7 +67,9 @@ chmod +x simple-sqli-detector.py
 5) Fast modes:
 
 `python3 simple-sqli-scanner.py -r packet.txt -faster`
+
 `python3 simple-sqli-scanner.py -r packet.txt -fastest`
+
 `python3 simple-sqli-scanner.py -r packet.txt -fastest -f`
 
 6) Scan a single URL:
