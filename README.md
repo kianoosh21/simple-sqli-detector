@@ -25,7 +25,7 @@ A lightweight **error-based SQLi heuristic scanner** that looks for **500 → no
   - Default: tests **GET + POST params only**
   - `-c, --cookie-only`: tests **COOKIE params only**
   - `-f, --full`: tests **GET + POST + COOKIE + headers**
-    - Header probes: `User-Agent`, `Referer`, `X-Forwarded-For` (added if missing)
+    - Header probes: `User-Agent`, `Referer`, `X-Forwarded-For` (will be added if missing)
 
 - **Quality-of-life**
   - Auto JSON detection (Content-Type or valid JSON body)
