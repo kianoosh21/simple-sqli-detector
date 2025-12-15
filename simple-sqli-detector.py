@@ -972,7 +972,7 @@ def url_to_request(url: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='SQLi Detection Tool - Error-based SQLi scanner',
+        description='Super Simple SQLi Detection Tool - Error-based SQLi scanner',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Scope:
@@ -987,11 +987,11 @@ Modes:
   -fastest                Fastest mode with minimal requests
 
 Examples:
-  python3 test.py -r packet.txt
-  python3 test.py -r packet.txt --proxy http://127.0.0.1:8080
-  python3 test.py -r packet.txt -c                    # cookie-only
-  python3 test.py -r packet.txt -f                    # full (params + cookies + headers)
-  python3 test.py -r packet.txt -fastest -f
+  python3 simple-sqli-detector.py -r packet.txt
+  python3 simple-sqli-detector.py -r packet.txt --proxy http://127.0.0.1:8080
+  python3 simple-sqli-detector.py -r packet.txt -c                    # cookie-only
+  python3 simple-sqli-detector.py -r packet.txt -f                    # full (params + cookies + headers)
+  python3 simple-sqli-detector.py -r packet.txt -fastest -f
         """
     )
 
