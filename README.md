@@ -113,5 +113,5 @@ No responsibility for misuse.
 ![Example usage](2.png)
 
 
-### Example usage (testing full mode on top of testing for the prams it will check for cookies -> UserAgent + Referer + X-Forwarded-For)
+### Example usage (testing full mode on top of testing for all prams it will check for cookies + UserAgent + Referer + X-Forwarded-For)
 ![Example usage](3.png)
