@@ -105,3 +105,9 @@ No responsibility for misuse.
 ## Screenshot (`-h` output)
 
 ![test.py -h output](help.png)
+
+### Example usage (1)
+![Example usage 1](1.png)
+
+### Example usage (2)
+![Example usage 2](2.png)
