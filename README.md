@@ -51,7 +51,7 @@ chmod +x simple-sqli-detector.py
 
 `python3 simple-sqli-scanner.py -r packet.txt`
 
-2) Scan multiple Burp requests in a single file:
+2) Scan multiple http requests in a single file:
 
 `python3 simple-sqli-scanner.py -r multi-requests.txt`
 
