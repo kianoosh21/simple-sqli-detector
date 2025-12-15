@@ -48,7 +48,7 @@ chmod +x test.py
 ## Usage
 
 1) Scan a raw Burp request file:
-python3 test.py -r packet.txt
+python3 simple-sqli-scanner.py -r packet.txt
 
 2) Scan multiple Burp requests in a single file:
 python3 test.py -r multi-requests.txt
