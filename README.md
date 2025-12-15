@@ -48,29 +48,37 @@ chmod +x simple-sqli-detector.py
 ## Usage
 
 1) Scan a raw Burp request file:
-\n`python3 simple-sqli-scanner.py -r packet.txt`
+
+`python3 simple-sqli-scanner.py -r packet.txt`
 
 2) Scan multiple Burp requests in a single file:
+
 `python3 simple-sqli-scanner.py -r multi-requests.txt (multiple Raw burp copy/pasted input - should be placed after 2 empty lines each)`
 
 3) Cookie-only scanning:
+
 `python3 simple-sqli-scanner.py -r packet.txt -c`
 
 4) Full scanning (params + cookies + header probes):
+
 `python3 simple-sqli-scanner.py -r packet.txt -f`
 
 5) Fast modes:
+
 `python3 simple-sqli-scanner.py -r packet.txt -faster`
 `python3 simple-sqli-scanner.py -r packet.txt -fastest`
 `python3 simple-sqli-scanner.py -r packet.txt -fastest -f`
 
 6) Scan a single URL:
+
 `python3 simple-sqli-scanner.py -u "https://example.com/page?id=1"`
 
 7) Scan a list of URLs:
+
 `python3 simple-sqli-scanner.py -ul urls.txt`
 
 8) Use Burp proxy:
+
 `python3 simple-sqli-scanner.py -r packet.txt --proxy http://127.0.0.1:8080`
 
 ---
