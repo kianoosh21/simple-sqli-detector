@@ -106,12 +106,12 @@ No responsibility for misuse.
 
 ![test.py -h output](help.png)
 
-### Example usage (1)
-![Example usage - testing all params POST/GET (if body is json will automatically detect)](1.png)
+### Example usage (testing all params POST/GET (if body is json will automatically detect)
+![Example usage](1.png)
 
-### Example usage (2)
-![Example usage - only testing all cookies in the packet.txt](2.png)
+### Example usage (only testing all cookies in the packet.txt)
+![Example usage](2.png)
 
 
-### Example usage (3)
-![Example usage - testing full mode on top of testing for the prams it will check for cookies -> UserAgent + Referer + X-Forwarded-For](3.png)
+### Example usage (testing full mode on top of testing for the prams it will check for cookies -> UserAgent + Referer + X-Forwarded-For)
+![Example usage](3.png)
