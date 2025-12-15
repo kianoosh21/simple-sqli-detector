@@ -117,7 +117,7 @@ No responsibility for misuse.
 
 ## Screenshot (`-h` output)
 
-![test.py -h output](help.png)
+![simple-sqli-detector.py -h output](help.png)
 
 ### Example usage (testing all params POST/GET (if body is json will automatically detect)
 ![Example usage](1.png)
