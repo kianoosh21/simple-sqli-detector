@@ -38,7 +38,7 @@ A lightweight **error-based SQLi heuristic scanner** that looks for **500 → no
 
 Requires: `python3` + `curl to be already installed on your system`
 
-chmod +x test.py
+chmod +x simple-sqli-detector.py
 
 (Optional) Use a proxy (Burp/ZAP):
 --proxy http://127.0.0.1:8080
