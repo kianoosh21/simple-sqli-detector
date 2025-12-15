@@ -81,7 +81,7 @@ chmod +x simple-sqli-detector.py
 
 `python3 simple-sqli-scanner.py -ul urls.txt`
 
-8) Use Burp proxy:
+8) Use proxy:
 
 `python3 simple-sqli-scanner.py -r packet.txt --proxy http://127.0.0.1:8080`
 
