@@ -108,6 +108,13 @@ If you get a “probable” finding:
 
 ---
 
+## Screenshots
+
+### `-h` output
+![simple-sqli-detector.py -h output](help.png)
+
+---
+
 ## Legal / Ethical
 
 Use **only on systems you own or have explicit permission to test**.  
