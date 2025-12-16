@@ -115,16 +115,3 @@ No responsibility for misuse.
 
 ---
 
-## Screenshot (`-h` output)
-
-![simple-sqli-detector.py -h output](help.png)
-
-### Example usage (testing all params POST/GET (if body is json will automatically detect)
-![Example usage](1.png)
-
-### Example usage (only testing all cookies in the packet.txt)
-![Example usage](2.png)
-
-
-### Example usage (testing full mode on top of testing for all prams it will check for cookies + UserAgent + Referer + X-Forwarded-For)
-![Example usage](3.png)

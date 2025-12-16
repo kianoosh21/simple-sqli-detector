@@ -1,40 +1,50 @@
 #!/usr/bin/env python3
 """
-Super Simple SQL Injection Detection Tool - Full Featured (curl-based)
-Detects error-based SQLi hints using 500 -> non-500 status transitions
+simple-sqli-scanner.py
 
-Features:
-- Auto-detect JSON bodies (no need -json)
-- Optional -json to FORCE JSON mode
-- Strips Content-Length so curl recalculates after mutations (prevents JSON truncation/corruption)
-- Safe multi-request splitting (won't collide with header/body blank line)
+Heuristic SQLi scanner that looks for the pattern:
+  baseline (any) -> append quote -> 500 -> append double quote -> non-500
 
-Scope flags:
-- Default: test GET + POST params only
-- -c / --cookie-only : test COOKIE params ONLY
-- -f / --full        : test GET + POST + COOKIE together
-    + ALSO tests headers: User-Agent, Referer, X-Forwarded-For
-      (adds them if missing), appends ' and then '' and checks 500 -> non-500
+Supports:
+- Raw Burp request(s) in a file (-r). Multiple requests must be separated by TWO empty lines.
+- curl commands exported from Burp (also via -r)
+- Single URL (-u) and URL list (-ul)
+- Form bodies (x-www-form-urlencoded) and JSON bodies (including NESTED JSON)
+- Cookie-only mode (-c)
+- Full mode (-f): params + cookies + header probes (User-Agent / Referer / X-Forwarded-For)
 
-Report wording:
-- Uses "PROBABLE" / "Highly probable vulnerable parameters"
+JSON handling:
+- Auto-detect JSON when Content-Type is JSON OR body parses as JSON
+- Optional force JSON mode: -json (kept for README compatibility)
+
+Transport:
+- Uses curl for sending requests (curl recalculates Content-Length; Content-Length header is stripped when parsing raw requests).
+
+NOTE:
+This is a heuristic scanner. It reports "probable/highly probable" signals, not guaranteed SQL injection.
 """
-
+import re
 import argparse
 import subprocess
 import sys
 import json
-import re
-from urllib.parse import urlparse, urlunparse
-from typing import Dict, List, Tuple, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from typing import Dict, List, Tuple, Optional, Any, Union
+from urllib.parse import urlparse, urlunparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 print_lock = threading.Lock()
 
+RED = "\033[0;31m"
+NC  = "\033[0m"
+
+# ---------------------------
+# Curl / raw request parsing
+# ---------------------------
 
 class CurlParser:
-    """Parse curl commands from Burp Suite OR raw HTTP request"""
+    """Parse curl commands OR raw HTTP request from Burp copy-as-text."""
 
     __slots__ = ('curl_cmd', 'method', 'url', 'headers', 'cookies', 'body', 'extra_flags')
 
@@ -47,8 +57,12 @@ class CurlParser:
         self.body: Optional[str] = None
         self.extra_flags: List[str] = []
 
-    def parse(self) -> Dict:
-        if not self.curl_cmd.startswith('curl'):
+    def parse(self) -> Dict[str, Any]:
+        """Parse curl command into components; if not curl, parse raw request."""
+        if not self.curl_cmd:
+            return self._empty_result()
+
+        if not self.curl_cmd.lstrip().startswith('curl'):
             return self._parse_raw_request()
 
         cmd = self.curl_cmd.replace('\\\n', ' ').replace('\\\r\n', ' ')
@@ -73,8 +87,8 @@ class CurlParser:
                 i += 1
                 if i < len(tokens):
                     h = tokens[i]
-                    # IMPORTANT: drop Content-Length so curl recalculates correctly after mutation
-                    if not h.lower().startswith('content-length:'):
+                    # Strip Content-Length to avoid corrupting the request after mutations
+                    if not h.lower().startswith("content-length:"):
                         self.headers.append(h)
                 i += 1
                 continue
@@ -94,7 +108,7 @@ class CurlParser:
                 continue
 
             if tok in ('--path-as-is', '-k', '--insecure', '-s', '--silent',
-                       '--compressed', '-L', '--location'):
+                      '--compressed', '-L', '--location'):
                 self.extra_flags.append(tok)
                 i += 1
                 continue
@@ -117,31 +131,31 @@ class CurlParser:
             'extra_flags': self.extra_flags
         }
 
-    def _parse_raw_request(self) -> Dict:
-        lines = self.curl_cmd.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    def _parse_raw_request(self) -> Dict[str, Any]:
+        """Parse raw HTTP request from Burp (copy/paste)."""
+        lines = self.curl_cmd.split('\n')
         if not lines:
             return self._empty_result()
 
         parts = lines[0].strip().split(' ')
-        if len(parts) >= 2:
-            self.method = parts[0]
-            path = parts[1]
-        else:
+        if len(parts) < 2:
             return self._empty_result()
 
-        body_start = len(lines)
+        self.method = parts[0].strip()
+        path = parts[1].strip()
+
         host = None
         cookie_header = None
+        body_start = len(lines)
 
         for i, line in enumerate(lines[1:], 1):
-            raw = line
-            line = line.strip()
-            if not line:
+            line = line.rstrip('\r').strip('\n')
+            if not line.strip():
                 body_start = i + 1
                 break
 
-            if ':' in raw:
-                key, _, value = raw.partition(':')
+            if ':' in line:
+                key, _, value = line.partition(':')
                 key = key.strip()
                 value = value.strip()
 
@@ -149,14 +163,16 @@ class CurlParser:
                     host = value
                 elif key.lower() == 'cookie':
                     cookie_header = value
-                elif key.lower() == 'content-length':
-                    # IMPORTANT: drop it so curl recalculates correctly after mutation
-                    continue
                 else:
-                    self.headers.append(f"{key}: {value}")
+                    # Strip Content-Length so curl recalculates it safely after mutations
+                    if key.lower() != 'content-length':
+                        self.headers.append(f"{key}: {value}")
 
         if host:
-            self.url = f"https://{host}{path}"
+            if path.startswith("http://") or path.startswith("https://"):
+                self.url = path
+            else:
+                self.url = f"https://{host}{path}"
         else:
             self.url = path
 
@@ -166,7 +182,7 @@ class CurlParser:
         if body_start < len(lines):
             self.body = '\n'.join(lines[body_start:]).strip() or None
 
-        # Keep previous behavior
+        # Safe default; allows self-signed targets
         self.extra_flags.append('-k')
 
         return {
@@ -178,19 +194,13 @@ class CurlParser:
             'extra_flags': self.extra_flags
         }
 
-    def _empty_result(self) -> Dict:
-        return {
-            'method': 'GET',
-            'url': '',
-            'headers': [],
-            'cookies': [],
-            'body': None,
-            'extra_flags': []
-        }
+    def _empty_result(self) -> Dict[str, Any]:
+        return {'method': 'GET', 'url': '', 'headers': [], 'cookies': [], 'body': None, 'extra_flags': []}
 
     def _tokenize(self, cmd: str) -> List[str]:
-        tokens = []
-        current = []
+        """Tokenize command respecting quotes."""
+        tokens: List[str] = []
+        current: List[str] = []
         i = 0
         cmd_len = len(cmd)
 
@@ -256,132 +266,50 @@ class CurlParser:
         return tokens
 
 
+# ---------------------------
+# SQLi Detector
+# ---------------------------
+
 class SQLiDetector:
-    """Detect SQL injection vulnerabilities"""
+    """Detect SQL injection vulnerabilities via 500 -> non-500 transition heuristics."""
 
-    __slots__ = ('debug', 'proxy', 'max_workers', 'mode', 'scope', 'force_json')
+    __slots__ = ('debug', 'proxy', 'max_workers', 'mode', 'cookie_only', 'full_mode', 'force_json')
 
-    def __init__(self, debug: bool = False, proxy: Optional[str] = None,
-                 max_workers: int = 10, mode: str = 'single',
-                 scope: str = 'params',
-                 force_json: bool = False):
+    def __init__(
+        self,
+        debug: bool = False,
+        proxy: Optional[str] = None,
+        max_workers: int = 10,
+        mode: str = 'single',
+        cookie_only: bool = False,
+        full_mode: bool = False,
+        force_json: bool = False,
+    ):
         self.debug = debug
         self.proxy = proxy
         self.max_workers = max_workers
         self.mode = mode  # 'single', 'faster', 'fastest'
-        self.scope = scope  # 'params' | 'cookie' | 'full'
-        self.force_json = force_json  # legacy -json: force JSON mode for all requests
+        self.cookie_only = cookie_only
+        self.full_mode = full_mode
+        self.force_json = force_json
 
-    # ---------------- Auto JSON detection ----------------
+    # -------- curl plumbing --------
 
-    @staticmethod
-    def _headers_have_json(headers: List[str]) -> bool:
-        for h in headers:
-            if ':' not in h:
-                continue
-            k, _, v = h.partition(':')
-            if k.strip().lower() == 'content-type' and 'application/json' in v.lower():
-                return True
-        return False
-
-    @staticmethod
-    def _body_is_valid_json(body: Optional[str]) -> bool:
-        if not body:
-            return False
-        s = body.lstrip()
-        if not (s.startswith('{') or s.startswith('[')):
-            return False
-        try:
-            json.loads(body)
-            return True
-        except Exception:
-            return False
-
-    def _json_enabled_for_request(self, base_cmd: Dict) -> bool:
-        if self.force_json:
-            return True
-        if self._headers_have_json(base_cmd['headers']):
-            return True
-        if self._body_is_valid_json(base_cmd.get('body')):
-            return True
-        return False
-
-    # ---------------- Header helpers (for -f/--full) ----------------
-
-    @staticmethod
-    def _get_header_index_and_value(headers: List[str], header_name: str) -> Tuple[Optional[int], Optional[str]]:
-        target = header_name.lower()
-        for i, h in enumerate(headers):
-            if ':' not in h:
-                continue
-            k, _, v = h.partition(':')
-            if k.strip().lower() == target:
-                return i, v.lstrip()
-        return None, None
-
-    @staticmethod
-    def _set_or_add_header(headers: List[str], header_name: str, value: str) -> List[str]:
-        # replace if exists (case-insensitive), otherwise append
-        out = list(headers)
-        idx, _ = SQLiDetector._get_header_index_and_value(out, header_name)
-        line = f"{header_name}: {value}"
-        if idx is None:
-            out.append(line)
-        else:
-            out[idx] = line
-        return out
-
-    def _default_header_value(self, header_name: str, base_url: str) -> str:
-        hn = header_name.lower()
-        if hn == "user-agent":
-            return "Mozilla/5.0"
-        if hn == "referer":
-            try:
-                p = urlparse(base_url)
-                if p.scheme and p.netloc:
-                    return f"{p.scheme}://{p.netloc}/"
-            except Exception:
-                pass
-            return "https://example.com/"
-        if hn == "x-forwarded-for":
-            return "127.0.0.1"
-        return "x"
-
-    def _ensure_header_present(self, base_cmd: Dict, header_name: str) -> List[str]:
-        headers = list(base_cmd.get('headers', []))
-        idx, val = self._get_header_index_and_value(headers, header_name)
-        if idx is None:
-            headers = self._set_or_add_header(headers, header_name, self._default_header_value(header_name, base_cmd.get('url', '')))
-        elif val is None or val.strip() == "":
-            headers = self._set_or_add_header(headers, header_name, self._default_header_value(header_name, base_cmd.get('url', '')))
-        return headers
-
-    def _mutate_header_value(self, headers: List[str], header_name: str, suffix: str, base_url: str) -> List[str]:
-        # headers ALWAYS use literal quotes (NOT %27)
-        out = list(headers)
-        idx, val = self._get_header_index_and_value(out, header_name)
-        if idx is None:
-            base_val = self._default_header_value(header_name, base_url)
-        else:
-            base_val = val if val is not None else self._default_header_value(header_name, base_url)
-        return self._set_or_add_header(out, header_name, f"{base_val}{suffix}")
-
-    # ----------------------------------------------------
-
-    def build_curl_cmd(self, base_cmd: Dict, url: str, body: Optional[str] = None,
-                       cookies: Optional[List[str]] = None,
-                       headers_override: Optional[List[str]] = None) -> List[str]:
+    def build_curl_cmd(
+        self,
+        base_cmd: Dict[str, Any],
+        url: str,
+        body: Optional[str] = None,
+        cookies: Optional[List[str]] = None,
+        headers: Optional[List[str]] = None
+    ) -> List[str]:
         cmd = ['curl']
 
-        if base_cmd['method'] != 'GET':
+        if base_cmd['method'].upper() != 'GET':
             cmd.extend(['-X', base_cmd['method']])
 
-        # Choose headers (base or overridden)
-        headers_src = headers_override if headers_override is not None else base_cmd['headers']
-
-        # Safety filter: ensure Content-Length never gets forwarded
-        safe_headers = [h for h in headers_src if not h.lower().startswith('content-length:')]
-        cmd.extend(sum((['-H', h] for h in safe_headers), []))
+        hdrs = headers if headers is not None else base_cmd['headers']
+        cmd.extend(sum((['-H', h] for h in hdrs), []))
 
         cookie_list = cookies if cookies is not None else base_cmd['cookies']
         cmd.extend(sum((['-b', c] for c in cookie_list), []))
@@ -396,7 +324,6 @@ class SQLiDetector:
 
         cmd.extend(['-o', '/dev/null', '-w', '%{http_code}'])
         cmd.append(url)
-
         return cmd
 
     def execute_curl(self, cmd: List[str]) -> Optional[int]:
@@ -435,109 +362,73 @@ class SQLiDetector:
     def _escape_for_bash(token: str) -> str:
         if token.startswith("$'") and token.endswith("'"):
             return token
-
-        needs_escape = ' $&|;<>(){}[]?~`"\'\\\n\r\t'
+        needs_escape = ' $&|;<>(){}[]?~`"\'\\'
         if not any(c in token for c in needs_escape):
             return token
+        return "'" + token.replace("'", "'\\''") + "'"
 
-        return f"'{token.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
+    # -------- content-type / JSON detection --------
+
+    def is_json_body(self, headers: List[str], body: Optional[str]) -> bool:
+        if not body:
+            return False
+
+        b = body.strip()
+
+        # Force JSON mode if requested (kept for README compatibility)
+        if self.force_json:
+            try:
+                json.loads(b)
+                return True
+            except Exception:
+                return False
+
+        ct = None
+        for h in headers:
+            if h.lower().startswith("content-type:"):
+                ct = h.split(":", 1)[1].strip().lower()
+                break
+
+        if ct and "application/json" in ct:
+            return True
+
+        # Fallback: try parse if it looks like JSON
+        if b.startswith("{") or b.startswith("["):
+            try:
+                json.loads(b)
+                return True
+            except Exception:
+                return False
+
+        return False
 
     @staticmethod
     def _normalize_json_suffix(suffix: str) -> str:
-        # for JSON, use literal quotes not %27
-        if suffix == '%27':
+        """If caller used %27 for JSON, normalize to literal quotes."""
+        if suffix == "%27":
             return "'"
-        if suffix == '%27%27':
+        if suffix == "%27%27":
             return "''"
         return suffix
 
-    # --------- Mutation helpers (JSON-aware via runtime flag) ---------
+    # -------- param extraction --------
 
-    def _mutate_all_url_params(self, url: str, suffix: str) -> str:
-        clean_url = url[2:-1] if url.startswith("$'") and url.endswith("'") else url
-        parsed = urlparse(clean_url)
-        if not parsed.query:
-            return url
-
-        parts = []
-        for param in parsed.query.split('&'):
-            if '=' in param:
-                key, _, value = param.partition('=')
-                parts.append(f"{key}={value}{suffix}")
-            else:
-                parts.append(param)
-
-        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, '&'.join(parts), parsed.fragment))
-
-    def _mutate_all_body_params(self, body: str, suffix: str, json_enabled: bool) -> str:
-        if not body:
-            return body
-
-        if json_enabled and body.strip().startswith(('{', '[')):
-            try:
-                data = json.loads(body)
-                js_suffix = self._normalize_json_suffix(suffix)
-                mutated = self._mutate_json_recursive(data, js_suffix)
-                return json.dumps(mutated, ensure_ascii=False)
-            except Exception:
-                return body
-
-        if '=' in body:
-            parts = []
-            for param in body.split('&'):
-                if '=' in param:
-                    key, _, value = param.partition('=')
-                    parts.append(f"{key}={value}{suffix}")
-                else:
-                    parts.append(param)
-            return '&'.join(parts)
-
-        return body
-
-    def _mutate_json_recursive(self, data, suffix: str):
-        if isinstance(data, dict):
-            return {k: self._mutate_json_recursive(v, suffix) for k, v in data.items()}
-        if isinstance(data, list):
-            return [self._mutate_json_recursive(item, suffix) for item in data]
-        if isinstance(data, str):
-            return data + suffix
-        return data
-
-    def _mutate_all_cookies(self, cookies: List[str], suffix: str) -> List[str]:
-        mutated = []
-        for cookie in cookies:
-            parts = []
-            for part in cookie.split(';'):
-                part = part.strip()
-                if '=' in part:
-                    key, _, value = part.partition('=')
-                    parts.append(f"{key}={value}{suffix}")
-                else:
-                    parts.append(part)
-            mutated.append('; '.join(parts))
-        return mutated
-
-    def mutate_all_params(self, base_cmd: Dict, suffix: str, json_enabled: bool) -> Tuple[str, Optional[str], Optional[List[str]]]:
-        mutated_url = self._mutate_all_url_params(base_cmd['url'], suffix)
-        mutated_body = self._mutate_all_body_params(base_cmd['body'], suffix, json_enabled) if base_cmd.get('body') else base_cmd.get('body')
-
-        mutated_cookies = None
-        if base_cmd.get('cookies'):
-            mutated_cookies = self._mutate_all_cookies(base_cmd['cookies'], suffix)
-
-        return mutated_url, mutated_body, mutated_cookies
-
-    def mutate_only_cookies(self, base_cmd: Dict, suffix: str) -> Tuple[str, Optional[str], Optional[List[str]]]:
-        mutated_cookies = None
-        if base_cmd.get('cookies'):
-            mutated_cookies = self._mutate_all_cookies(base_cmd['cookies'], suffix)
-        return base_cmd['url'], base_cmd.get('body'), mutated_cookies
-
-    # ---------------- Extraction + single param mutation ----------------
-
-    def extract_params(self, url: str, body: Optional[str], json_enabled: bool) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    def extract_params(
+        self,
+        url: str,
+        body: Optional[str],
+        headers: List[str]
+    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]], List[str], bool]:
+        """
+        Returns:
+          get_params:  key -> list(values)
+          post_params: key -> list(values) (form)
+          json_paths:  list of JSON paths to STRING leaves (nested supported)
+          is_json:     body treated as JSON
+        """
         get_params: Dict[str, List[str]] = {}
         post_params: Dict[str, List[str]] = {}
+        json_paths: List[str] = []
 
         clean_url = url[2:-1] if url.startswith("$'") and url.endswith("'") else url
         parsed = urlparse(clean_url)
@@ -550,16 +441,18 @@ class SQLiDetector:
                 else:
                     get_params.setdefault(param, []).append('')
 
+        is_json = self.is_json_body(headers, body)
+
         if body:
-            if json_enabled and body.strip().startswith(('{', '[')):
+            if is_json:
                 try:
                     data = json.loads(body)
-                    json_params = self._extract_json_params(data)
-                    for key, value in json_params:
-                        post_params.setdefault(key, []).append(value)
+                    json_paths = self._extract_json_paths(data)
                 except Exception:
-                    pass
-            elif '=' in body and not body.strip().startswith(('{', '[')):
+                    json_paths = []
+                    is_json = False
+
+            if not is_json and '=' in body and not body.strip().startswith('{'):
                 for param in body.split('&'):
                     if '=' in param:
                         key, _, value = param.partition('=')
@@ -567,21 +460,7 @@ class SQLiDetector:
                     else:
                         post_params.setdefault(param, []).append('')
 
-        return get_params, post_params
-
-    def _extract_json_params(self, data, prefix='') -> List[Tuple[str, str]]:
-        params = []
-        if isinstance(data, dict):
-            for k, v in data.items():
-                key = f"{prefix}.{k}" if prefix else k
-                if isinstance(v, (dict, list)):
-                    params.extend(self._extract_json_params(v, key))
-                else:
-                    params.append((key, str(v)))
-        elif isinstance(data, list):
-            for i, item in enumerate(data):
-                params.extend(self._extract_json_params(item, f"{prefix}[{i}]"))
-        return params
+        return get_params, post_params, json_paths, is_json
 
     def extract_cookie_params(self, cookies: List[str]) -> Dict[str, List[str]]:
         cookie_params: Dict[str, List[str]] = {}
@@ -593,16 +472,101 @@ class SQLiDetector:
                     cookie_params.setdefault(key, []).append(value)
         return cookie_params
 
+    # -------- JSON path support (nested) --------
+
+    def _extract_json_paths(self, data: Any, prefix: str = "") -> List[str]:
+        """Return JSON paths for STRING leaf values (nested dict/list supported)."""
+        paths: List[str] = []
+        if isinstance(data, dict):
+            for k, v in data.items():
+                p = f"{prefix}.{k}" if prefix else k
+                paths.extend(self._extract_json_paths(v, p))
+        elif isinstance(data, list):
+            for i, v in enumerate(data):
+                p = f"{prefix}[{i}]" if prefix else f"[{i}]"
+                paths.extend(self._extract_json_paths(v, p))
+        else:
+            if isinstance(data, str) and prefix:
+                paths.append(prefix)
+        return paths
+
+    @staticmethod
+    def _parse_json_path(path: str) -> List[Union[str, int]]:
+        """
+        Parse JSON param path like:
+          updates[0].payload.value
+        -> ['updates', 0, 'payload', 'value']
+        """
+        tokens: List[Union[str, int]] = []
+        buf = ''
+        i = 0
+        n = len(path)
+
+        while i < n:
+            c = path[i]
+            if c == '.':
+                if buf:
+                    tokens.append(buf)
+                    buf = ''
+                i += 1
+                continue
+
+            if c == '[':
+                if buf:
+                    tokens.append(buf)
+                    buf = ''
+                j = path.find(']', i + 1)
+                if j == -1:
+                    break
+                idx_str = path[i + 1:j]
+                try:
+                    tokens.append(int(idx_str))
+                except ValueError:
+                    tokens.append(idx_str)
+                i = j + 1
+                continue
+
+            buf += c
+            i += 1
+
+        if buf:
+            tokens.append(buf)
+
+        return tokens
+
+    def _mutate_json_at_path(self, data: Any, tokens: List[Union[str, int]], suffix: str) -> Any:
+        """Functional update: mutate only the target string leaf, preserve rest of JSON."""
+        if not tokens:
+            if isinstance(data, str):
+                return data + suffix
+            return data
+
+        head, *tail = tokens
+
+        if isinstance(head, int) and isinstance(data, list):
+            new_list = list(data)
+            if 0 <= head < len(new_list):
+                new_list[head] = self._mutate_json_at_path(new_list[head], tail, suffix)
+            return new_list
+
+        if isinstance(head, str) and isinstance(data, dict):
+            new_obj = dict(data)
+            if head in new_obj:
+                new_obj[head] = self._mutate_json_at_path(new_obj[head], tail, suffix)
+            return new_obj
+
+        return data
+
+    # -------- mutations (URL / body / cookie / headers) --------
+
     def mutate_url_param(self, url: str, param_name: str, param_idx: int, suffix: str) -> str:
         clean_url = url[2:-1] if url.startswith("$'") and url.endswith("'") else url
         parsed = urlparse(clean_url)
-        if not parsed.query:
-            return clean_url
 
         parts = []
         current_idx: Dict[str, int] = {}
 
-        for param in parsed.query.split('&'):
+        for param in parsed.query.split('&') if parsed.query else []:
             if '=' in param:
                 key, _, value = param.partition('=')
                 idx = current_idx.get(key, 0)
@@ -613,9 +577,25 @@ class SQLiDetector:
             else:
                 parts.append(param)
 
-        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, '&'.join(parts), parsed.fragment))
+        return urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, '&'.join(parts), parsed.fragment
+        ))
 
-    def mutate_body_param(self, body: str, param_name: str, param_idx: int, suffix: str, json_enabled: bool) -> str:
+    def mutate_body_param(
+        self,
+        body: str,
+        param_name: str,
+        param_idx: int,
+        suffix: str,
+        json_enabled: bool
+    ) -> str:
+        """
+        Mutate a single body parameter.
+        - If json_enabled: param_name is treated as a JSON path (supports nested objects/arrays),
+          suffix is normalized to literal quotes if it was %27.
+        - Else: treat as x-www-form-urlencoded.
+        """
         if not body:
             return body
 
@@ -623,11 +603,14 @@ class SQLiDetector:
             try:
                 data = json.loads(body)
                 js_suffix = self._normalize_json_suffix(suffix)
-                mutated = self._mutate_json_param(data, param_name, js_suffix)
+                path_tokens = self._parse_json_path(param_name)
+                mutated = self._mutate_json_at_path(data, path_tokens, js_suffix)
+                # ensure_ascii=False to preserve unicode; JSON remains valid (quotes preserved)
                 return json.dumps(mutated, ensure_ascii=False)
             except Exception:
                 return body
 
+        # Form data
         parts = []
         current_idx: Dict[str, int] = {}
 
@@ -643,24 +626,6 @@ class SQLiDetector:
                 parts.append(param)
 
         return '&'.join(parts)
-
-    def _mutate_json_param(self, data, param_name: str, suffix: str):
-        if isinstance(data, dict):
-            result = {}
-            for k, v in data.items():
-                if k == param_name or param_name.startswith(f"{k}."):
-                    if isinstance(v, str):
-                        result[k] = v + suffix
-                    elif isinstance(v, (dict, list)):
-                        result[k] = self._mutate_json_param(v, param_name, suffix)
-                    else:
-                        result[k] = v
-                else:
-                    result[k] = v
-            return result
-        if isinstance(data, list):
-            return [self._mutate_json_param(item, param_name, suffix) for item in data]
-        return data
 
     def mutate_cookie_param(self, cookies: List[str], param_name: str, param_idx: int, suffix: str) -> List[str]:
         mutated = []
@@ -683,89 +648,65 @@ class SQLiDetector:
 
         return mutated
 
-    # ---------------- Header-only tests (for -f/--full) ----------------
+    @staticmethod
+    def _get_header(headers: List[str], name: str) -> Optional[Tuple[int, str]]:
+        ln = name.lower()
+        for i, h in enumerate(headers):
+            if ':' not in h:
+                continue
+            k, _, v = h.partition(':')
+            if k.strip().lower() == ln:
+                return i, v.strip()
+        return None
 
-    def scan_headers_only(self, base_cmd: Dict) -> List[Dict]:
-        """
-        Tests headers (User-Agent, Referer, X-Forwarded-For) ONLY.
-        Logic:
-          baseline with ensured header -> append ' -> expect 500 -> append '' -> expect non-500
-        """
-        header_names = ["User-Agent", "Referer", "X-Forwarded-For"]
-        findings: List[Dict] = []
-        tasks = [(base_cmd, hn) for hn in header_names]
+    @staticmethod
+    def _set_header(headers: List[str], name: str, value: str) -> List[str]:
+        out = list(headers)
+        found = False
+        ln = name.lower()
+        for i, h in enumerate(out):
+            if ':' not in h:
+                continue
+            k, _, _ = h.partition(':')
+            if k.strip().lower() == ln:
+                out[i] = f"{name}: {value}"
+                found = True
+                break
+        if not found:
+            out.append(f"{name}: {value}")
+        return out
 
-        with ThreadPoolExecutor(max_workers=min(self.max_workers, 3) or 1) as executor:
-            future_to_task = {executor.submit(self.test_header, *task): task for task in tasks}
-            for future in as_completed(future_to_task):
-                result = future.result()
-                if result:
-                    findings.append(result)
+    # -------- scanning modes --------
 
-        return findings
-
-    def test_header(self, base_cmd: Dict, header_name: str) -> Optional[Dict]:
-        # Ensure header exists for baseline/consistency
-        base_headers = self._ensure_header_present(base_cmd, header_name)
-
-        baseline_cmd = self.build_curl_cmd(base_cmd, base_cmd['url'], base_cmd.get('body'), base_cmd.get('cookies'), headers_override=base_headers)
-        baseline_status = self.execute_curl(baseline_cmd)
-        if baseline_status is None:
-            return None
-
-        # Single quote
-        quote_headers = self._mutate_header_value(base_headers, header_name, "'", base_cmd.get('url', ''))
-        quote_cmd = self.build_curl_cmd(base_cmd, base_cmd['url'], base_cmd.get('body'), base_cmd.get('cookies'), headers_override=quote_headers)
-        quote_status = self.execute_curl(quote_cmd)
-        if quote_status is None or quote_status != 500:
-            return None
-
-        # Two quotes (''), should "fix" and become non-500
-        dquote_headers = self._mutate_header_value(base_headers, header_name, "''", base_cmd.get('url', ''))
-        dquote_cmd = self.build_curl_cmd(base_cmd, base_cmd['url'], base_cmd.get('body'), base_cmd.get('cookies'), headers_override=dquote_headers)
-        dquote_status = self.execute_curl(dquote_cmd)
-        if dquote_status is None or dquote_status == 500:
-            return None
-
-        return {
-            'param': header_name,
-            'type': 'HEADER',
-            'baseline': baseline_status,
-            'quote': quote_status,
-            'dquote': dquote_status,
-            'quote_cmd': ' '.join(self._escape_for_bash(t) for t in quote_cmd),
-            'dquote_cmd': ' '.join(self._escape_for_bash(t) for t in dquote_cmd),
-            'url': base_cmd['url']
-        }
-
-    # ---------------- Scanning modes ----------------
-
-    def scan_faster(self, base_cmd: Dict, json_enabled: bool) -> List[Dict]:
+    def scan_faster(self, base_cmd: Dict[str, Any]) -> List[Dict[str, Any]]:
         print("Mode: FASTER (batch test with single-recursive fallback)")
 
-        if self.scope == 'cookie':
-            mut_url, mut_body, mut_cookies = self.mutate_only_cookies(base_cmd, '%27')
-        else:
-            mut_url, mut_body, mut_cookies = self.mutate_all_params(base_cmd, '%27', json_enabled)
+        json_enabled = self.is_json_body(base_cmd['headers'], base_cmd.get('body'))
+
+        # Mutate all params at once
+        mut_url = self._mutate_all_url_params(base_cmd['url'], '%27')
+        mut_body = self._mutate_all_body(base_cmd.get('body'), '%27', json_enabled)
+        mut_cookies = self._mutate_all_cookies(base_cmd.get('cookies', []), "'") if base_cmd.get('cookies') else None
 
         cmd = self.build_curl_cmd(base_cmd, mut_url, mut_body, mut_cookies)
         status = self.execute_curl(cmd)
 
         if status == 500:
             print("  → Got 500, switching to single-recursive mode")
-            return self.scan_single_recursive(base_cmd, json_enabled)
+            return self.scan_single_recursive(base_cmd)
+        else:
+            print(f"  → Got {status}, skipping")
+            return []
 
-        print(f"  → Got {status}, skipping")
-        return []
-
-    def scan_fastest(self, base_cmd: Dict, json_enabled: bool) -> List[Dict]:
+    def scan_fastest(self, base_cmd: Dict[str, Any]) -> List[Dict[str, Any]]:
         print("Mode: FASTEST (batch test with double-quote verification)")
 
-        if self.scope == 'cookie':
-            mut_url1, mut_body1, mut_cookies1 = self.mutate_only_cookies(base_cmd, '%27')
-        else:
-            mut_url1, mut_body1, mut_cookies1 = self.mutate_all_params(base_cmd, '%27', json_enabled)
+        json_enabled = self.is_json_body(base_cmd['headers'], base_cmd.get('body'))
 
+        # Test with single quote
+        mut_url1 = self._mutate_all_url_params(base_cmd['url'], '%27')
+        mut_body1 = self._mutate_all_body(base_cmd.get('body'), '%27', json_enabled)
+        mut_cookies1 = self._mutate_all_cookies(base_cmd.get('cookies', []), "'") if base_cmd.get('cookies') else None
         cmd1 = self.build_curl_cmd(base_cmd, mut_url1, mut_body1, mut_cookies1)
         status1 = self.execute_curl(cmd1)
 
@@ -775,54 +716,178 @@ class SQLiDetector:
 
         print("  → Got 500 with single quote")
 
-        if self.scope == 'cookie':
-            mut_url2, mut_body2, mut_cookies2 = self.mutate_only_cookies(base_cmd, '%27%27')
-        else:
-            mut_url2, mut_body2, mut_cookies2 = self.mutate_all_params(base_cmd, '%27%27', json_enabled)
-
+        # Test with double quote
+        mut_url2 = self._mutate_all_url_params(base_cmd['url'], '%27%27')
+        mut_body2 = self._mutate_all_body(base_cmd.get('body'), '%27%27', json_enabled)
+        mut_cookies2 = self._mutate_all_cookies(base_cmd.get('cookies', []), "''") if base_cmd.get('cookies') else None
         cmd2 = self.build_curl_cmd(base_cmd, mut_url2, mut_body2, mut_cookies2)
         status2 = self.execute_curl(cmd2)
 
         if status2 != 500:
-            print(f"  → Got {status2} with double quote, fallback to identify probable vulnerable param")
-            return self.scan_single_recursive(base_cmd, json_enabled)
+            print(f"  → Got {status2} with double quote, fallback to identify probable input")
+            return self.scan_single_recursive(base_cmd)
+        else:
+            print("  → Still 500 with double quote, skipping")
+            return []
 
-        print("  → Still 500 with double quote, skipping")
-        return []
+    @staticmethod
+    def _mutate_all_url_params(url: str, suffix: str) -> str:
+        clean_url = url[2:-1] if url.startswith("$'") and url.endswith("'") else url
+        parsed = urlparse(clean_url)
+        if not parsed.query:
+            return url
 
-    def scan_single_recursive(self, base_cmd: Dict, json_enabled: bool) -> List[Dict]:
-        get_params, post_params = self.extract_params(base_cmd['url'], base_cmd['body'], json_enabled)
-        cookie_params = self.extract_cookie_params(base_cmd['cookies']) if base_cmd.get('cookies') else {}
+        parts = []
+        for param in parsed.query.split('&'):
+            if '=' in param:
+                key, _, value = param.partition('=')
+                parts.append(f"{key}={value}{suffix}")
+            else:
+                parts.append(param)
 
-        # Scope behavior
-        if self.scope == 'cookie':
-            get_params = {}
-            post_params = {}
-        elif self.scope == 'params':
-            cookie_params = {}
+        return urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, '&'.join(parts), parsed.fragment
+        ))
 
+    def _mutate_all_body(self, body: Optional[str], suffix: str, json_enabled: bool) -> Optional[str]:
+        if body is None:
+            return None
+
+        if json_enabled and body.strip().startswith(('{', '[')):
+            try:
+                data = json.loads(body)
+                js_suffix = self._normalize_json_suffix(suffix)
+                mutated = self._mutate_json_recursive(data, js_suffix)
+                return json.dumps(mutated, ensure_ascii=False)
+            except Exception:
+                return body
+
+        if '=' in body:
+            parts = []
+            for param in body.split('&'):
+                if '=' in param:
+                    key, _, value = param.partition('=')
+                    parts.append(f"{key}={value}{suffix}")
+                else:
+                    parts.append(param)
+            return '&'.join(parts)
+
+        return body
+
+    @staticmethod
+    def _mutate_json_recursive(data: Any, suffix: str) -> Any:
+        if isinstance(data, dict):
+            return {k: SQLiDetector._mutate_json_recursive(v, suffix) for k, v in data.items()}
+        if isinstance(data, list):
+            return [SQLiDetector._mutate_json_recursive(v, suffix) for v in data]
+        if isinstance(data, str):
+            return data + suffix
+        return data
+
+    @staticmethod
+    def _mutate_all_cookies(cookies: List[str], suffix: str) -> List[str]:
+        mutated = []
+        for cookie in cookies:
+            parts = []
+            for part in cookie.split(';'):
+                part = part.strip()
+                if '=' in part:
+                    key, _, value = part.partition('=')
+                    parts.append(f"{key}={value}{suffix}")
+                else:
+                    parts.append(part)
+            mutated.append('; '.join(parts))
+        return mutated
+
+    def scan_single_recursive(self, base_cmd: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # Decide what to test:
+        # -cookie_only: ONLY cookies
+        # -full: params + cookies + header probes
+        # default: params (GET + POST/JSON) only
+        headers = base_cmd['headers']
+        json_enabled = self.is_json_body(headers, base_cmd.get('body'))
+
+        get_params, post_params, json_paths, is_json = self.extract_params(
+            base_cmd['url'], base_cmd.get('body'), headers
+        )
+
+        cookie_params = self.extract_cookie_params(base_cmd.get('cookies', [])) if base_cmd.get('cookies') else {}
+
+        do_params = (not self.cookie_only)
+        do_cookies = (self.cookie_only or self.full_mode)
+        do_headers = self.full_mode
+
+        # Count for display
         get_count = sum(len(v) for v in get_params.values())
         post_count = sum(len(v) for v in post_params.values())
+        json_count = len(json_paths) if is_json else 0
         cookie_count = sum(len(v) for v in cookie_params.values())
 
-        print(f"Found {get_count} GET, {post_count} POST, {cookie_count} COOKIE parameter(s)")
+        if self.cookie_only:
+            print(f"Found {cookie_count} COOKIE parameter(s) (cookie-only mode)")
+        else:
+            if is_json:
+                print(f"Found {get_count} GET, {json_count} JSON string-leaf parameter(s)")
+            else:
+                print(f"Found {get_count} GET, {post_count} POST, {cookie_count} COOKIE parameter(s)")
 
-        tasks = []
-        for param_name, values in get_params.items():
-            for idx in range(len(values)):
-                tasks.append((base_cmd, param_name, idx, 'GET', json_enabled))
+        findings: List[Dict[str, Any]] = []
+        tasks: List[Tuple[Any, ...]] = []
 
-        for param_name, values in post_params.items():
-            for idx in range(len(values)):
-                tasks.append((base_cmd, param_name, idx, 'POST', json_enabled))
+        # GET/POST/JSON params
+        if do_params:
+            for param_name, values in get_params.items():
+                for idx in range(len(values)):
+                    tasks.append((base_cmd, param_name, idx, 'GET', json_enabled))
 
-        for param_name, values in cookie_params.items():
-            for idx in range(len(values)):
-                tasks.append((base_cmd, param_name, idx, 'COOKIE', json_enabled))
+            if is_json:
+                for path in json_paths:
+                    tasks.append((base_cmd, path, 0, 'JSON', json_enabled))
+            else:
+                for param_name, values in post_params.items():
+                    for idx in range(len(values)):
+                        tasks.append((base_cmd, param_name, idx, 'POST', json_enabled))
 
-        findings = []
+        # Cookies
+        if do_cookies:
+            for param_name, values in cookie_params.items():
+                for idx in range(len(values)):
+                    tasks.append((base_cmd, param_name, idx, 'COOKIE', json_enabled))
+
+        # Header probes (full mode)
+        if do_headers:
+            base_headers = list(base_cmd['headers'])
+
+            # Ensure headers exist; add if missing
+            if self._get_header(base_headers, "User-Agent") is None:
+                base_headers = self._set_header(base_headers, "User-Agent", "Mozilla/5.0")
+            if self._get_header(base_headers, "Referer") is None:
+                try:
+                    p = urlparse(base_cmd['url'])
+                    base_headers = self._set_header(base_headers, "Referer", f"{p.scheme}://{p.netloc}/")
+                except Exception:
+                    base_headers = self._set_header(base_headers, "Referer", "https://example.com/")
+            if self._get_header(base_headers, "X-Forwarded-For") is None:
+                base_headers = self._set_header(base_headers, "X-Forwarded-For", "127.0.0.1")
+
+            # Update base_cmd headers for consistent baselines in header tests
+            base_cmd = dict(base_cmd)
+            base_cmd['headers'] = base_headers
+
+            tasks.append((base_cmd, "User-Agent", 0, "HEADER", json_enabled))
+            tasks.append((base_cmd, "Referer", 0, "HEADER", json_enabled))
+            tasks.append((base_cmd, "X-Forwarded-For", 0, "HEADER", json_enabled))
+
+        if not tasks:
+            print("Nothing to test with selected flags.")
+            return []
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_task = {executor.submit(self.test_parameter, *task): task for task in tasks}
+            future_to_task = {
+                executor.submit(self.test_parameter, *task): task
+                for task in tasks
+            }
             for future in as_completed(future_to_task):
                 result = future.result()
                 if result:
@@ -830,52 +895,98 @@ class SQLiDetector:
 
         return findings
 
-    def test_parameter(self, base_cmd: Dict, param_name: str, param_idx: int, param_type: str, json_enabled: bool) -> Optional[Dict]:
-        baseline_cmd = self.build_curl_cmd(base_cmd, base_cmd['url'], base_cmd.get('body'), base_cmd.get('cookies'))
+    # -------- per-input test --------
+
+    def test_parameter(
+        self,
+        base_cmd: Dict[str, Any],
+        param_name: str,
+        param_idx: int,
+        param_type: str,
+        json_enabled: bool
+    ) -> Optional[Dict[str, Any]]:
+        if self.debug:
+            with print_lock:
+                print(f"  Testing {param_type}: {param_name}[{param_idx}]")
+
+        # Baseline
+        baseline_cmd = self.build_curl_cmd(
+            base_cmd,
+            base_cmd['url'],
+            base_cmd.get('body'),
+            base_cmd.get('cookies'),
+            base_cmd.get('headers')
+        )
         baseline_status = self.execute_curl(baseline_cmd)
         if baseline_status is None:
             return None
 
-        # single quote probe
-        if param_type == 'GET':
-            mut_url = self.mutate_url_param(base_cmd['url'], param_name, param_idx, '%27')
-            mut_body = base_cmd.get('body')
-            mut_cookies = base_cmd.get('cookies')
-        elif param_type == 'POST':
-            mut_url = base_cmd['url']
-            mut_body = self.mutate_body_param(base_cmd.get('body') or '', param_name, param_idx, '%27', json_enabled)
-            mut_cookies = base_cmd.get('cookies')
-        else:  # COOKIE
-            mut_url = base_cmd['url']
-            mut_body = base_cmd.get('body')
-            mut_cookies = self.mutate_cookie_param(base_cmd.get('cookies') or [], param_name, param_idx, '%27')
+        # Suffix choice:
+        # - JSON: literal ' / '' (handled by mutate_body_param normalization too, but keep clean)
+        # - Form/URL: %27 / %27%27
+        if param_type == 'JSON':
+            s1, s2 = "%27", "%27%27"  # normalize inside mutate_body_param()
+        elif param_type in ('COOKIE', 'HEADER'):
+            s1, s2 = "'", "''"
+        else:
+            s1, s2 = "%27", "%27%27"
 
-        quote_cmd = self.build_curl_cmd(base_cmd, mut_url, mut_body, mut_cookies)
-        quote_status = self.execute_curl(quote_cmd)
+        def run_mutation(suffix: str) -> Tuple[Optional[int], List[str]]:
+            if param_type == 'GET':
+                mut_url = self.mutate_url_param(base_cmd['url'], param_name, param_idx, suffix)
+                mut_body = base_cmd.get('body')
+                mut_cookies = base_cmd.get('cookies')
+                mut_headers = base_cmd.get('headers')
+
+            elif param_type == 'POST':
+                mut_url = base_cmd['url']
+                mut_body = self.mutate_body_param(base_cmd.get('body') or "", param_name, param_idx, suffix, False)
+                mut_cookies = base_cmd.get('cookies')
+                mut_headers = base_cmd.get('headers')
+
+            elif param_type == 'JSON':
+                mut_url = base_cmd['url']
+                mut_body = self.mutate_body_param(base_cmd.get('body') or "", param_name, param_idx, suffix, True)
+                mut_cookies = base_cmd.get('cookies')
+                mut_headers = base_cmd.get('headers')
+
+            elif param_type == 'COOKIE':
+                mut_url = base_cmd['url']
+                mut_body = base_cmd.get('body')
+                mut_cookies = self.mutate_cookie_param(base_cmd.get('cookies', []), param_name, param_idx, suffix)
+                mut_headers = base_cmd.get('headers')
+
+            else:  # HEADER
+                mut_url = base_cmd['url']
+                mut_body = base_cmd.get('body')
+                mut_cookies = base_cmd.get('cookies')
+                # append suffix to header value (create baseline already ensured in scan_single_recursive full-mode)
+                found = self._get_header(base_cmd.get('headers', []), param_name)
+                current_val = found[1] if found else ""
+                mut_headers = self._set_header(base_cmd.get('headers', []), param_name, current_val + suffix)
+
+            cmd = self.build_curl_cmd(base_cmd, mut_url, mut_body, mut_cookies, mut_headers)
+            st = self.execute_curl(cmd)
+            return st, cmd
+
+        # Single quote
+        quote_status, quote_cmd = run_mutation(s1)
         if quote_status is None or quote_status != 500:
             return None
 
-        # two single quotes probe
-        if param_type == 'GET':
-            mut_url2 = self.mutate_url_param(base_cmd['url'], param_name, param_idx, '%27%27')
-            mut_body2 = base_cmd.get('body')
-            mut_cookies2 = base_cmd.get('cookies')
-        elif param_type == 'POST':
-            mut_url2 = base_cmd['url']
-            mut_body2 = self.mutate_body_param(base_cmd.get('body') or '', param_name, param_idx, '%27%27', json_enabled)
-            mut_cookies2 = base_cmd.get('cookies')
-        else:  # COOKIE
-            mut_url2 = base_cmd['url']
-            mut_body2 = base_cmd.get('body')
-            mut_cookies2 = self.mutate_cookie_param(base_cmd.get('cookies') or [], param_name, param_idx, '%27%27')
-
-        dquote_cmd = self.build_curl_cmd(base_cmd, mut_url2, mut_body2, mut_cookies2)
-        dquote_status = self.execute_curl(dquote_cmd)
+        # Double quote
+        dquote_status, dquote_cmd = run_mutation(s2)
         if dquote_status is None or dquote_status == 500:
             return None
 
+        # Label
+        if param_type == 'JSON':
+            label = param_name
+        else:
+            label = f"{param_name}[{param_idx}]"
+
         return {
-            'param': f"{param_name}[{param_idx}]",
+            'param': label,
             'type': param_type,
             'baseline': baseline_status,
             'quote': quote_status,
@@ -885,113 +996,133 @@ class SQLiDetector:
             'url': base_cmd['url']
         }
 
-    def scan(self, content: str) -> List[Dict]:
+    # -------- dispatch --------
+
+    def scan(self, content: str) -> List[Dict[str, Any]]:
         parser = CurlParser(content)
         base_cmd = parser.parse()
 
-        if not base_cmd.get('url'):
+        if not base_cmd['url']:
             print("Error: No URL found in request", file=sys.stderr)
             return []
 
-        json_enabled = self._json_enabled_for_request(base_cmd)
-        if json_enabled:
-            print(f"\nTarget: {base_cmd['method']} {base_cmd['url']} (auto-detected JSON body)")
-        else:
-            print(f"\nTarget: {base_cmd['method']} {base_cmd['url']}")
+        print(f"\nTarget: {base_cmd['method']} {base_cmd['url']}")
 
-        # Run main scan (params/cookies based on scope & mode)
         if self.mode == 'faster':
-            findings = self.scan_faster(base_cmd, json_enabled)
+            return self.scan_faster(base_cmd)
         elif self.mode == 'fastest':
-            findings = self.scan_fastest(base_cmd, json_enabled)
+            return self.scan_fastest(base_cmd)
         else:
-            findings = self.scan_single_recursive(base_cmd, json_enabled)
-
-        # In FULL scope, ALWAYS also test headers (even if batch mode "skipped")
-        if self.scope == 'full':
-            header_findings = self.scan_headers_only(base_cmd)
-            if header_findings:
-                findings.extend(header_findings)
-
-        return findings
+            return self.scan_single_recursive(base_cmd)
 
 
-def split_requests(content: str) -> List[str]:
-    """
-    Safe splitter for multiple raw Burp requests in one file.
-    - Allows ONE blank line inside a request (headers/body separator)
-    - Splits on TWO consecutive blank lines OR a new request-line after a blank line
-    """
-    content = content.replace('\r\n', '\n').replace('\r', '\n')
-    lines = content.split('\n')
-
-    request_line_re = re.compile(
-        r'^(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD|TRACE|CONNECT)\s+\S+\s+HTTP/\d(\.\d)?\s*$'
-    )
-
-    requests = []
-    current = []
-    blank_run = 0
-
-    def flush():
-        nonlocal current
-        while current and not current[-1].strip():
-            current.pop()
-        if current:
-            req = '\n'.join(current).strip('\n')
-            if req.strip():
-                requests.append(req)
-        current = []
-
-    for line in lines:
-        if not line.strip():
-            blank_run += 1
-            current.append(line)
-            if blank_run >= 2:
-                flush()
-                blank_run = 0
-            continue
-
-        if current and blank_run >= 1 and request_line_re.match(line):
-            flush()
-
-        current.append(line)
-        blank_run = 0
-
-    flush()
-    return requests
-
+# ---------------------------
+# Request preparation
+# ---------------------------
 
 def url_to_request(url: str) -> str:
     parsed = urlparse(url)
     path = parsed.path or '/'
     if parsed.query:
         path += '?' + parsed.query
-    return f"GET {path} HTTP/1.1\nHost: {parsed.netloc}\n"
+    request = f"GET {path} HTTP/1.1\nHost: {parsed.netloc}\n\n"
+    return request
+
+
+def split_requests(content: str) -> List[str]:
+    """
+    Split multiple raw requests separated by TWO (or more) consecutive empty lines.
+    This avoids colliding with the normal single empty line between headers and body.
+    """
+    lines = content.split('\n')
+    requests: List[str] = []
+    cur: List[str] = []
+    blank_run = 0
+
+    for line in lines:
+        if not line.strip():
+            blank_run += 1
+            cur.append(line)
+            if blank_run >= 2:
+                # boundary: trim trailing blanks
+                while cur and not cur[-1].strip():
+                    cur.pop()
+                if cur:
+                    requests.append('\n'.join(cur).strip('\n'))
+                cur = []
+                blank_run = 0
+            continue
+        else:
+            blank_run = 0
+            cur.append(line)
+
+    while cur and not cur[-1].strip():
+        cur.pop()
+    if cur:
+        requests.append('\n'.join(cur).strip('\n'))
+
+    return [r for r in requests if r.strip()]
+
+
+# ---------------------------
+# Main
+# ---------------------------
+
+
+def _display_hit_name(ftype: str, raw_param: str) -> str:
+    """
+    Make hit names user-friendly.
+    - JSON: show only the leaf key name (e.g., updates[0].payload.value -> value)
+    - GET/POST/COOKIE: show only the key (e.g., id[0] -> id)
+    - HEADER: keep header name as-is
+    """
+    if not raw_param:
+        return "Unknown"
+
+    if ftype == "JSON":
+        # take last segment after dot
+        leaf = raw_param.rsplit(".", 1)[-1]
+        # strip array indexes if any (rare on leaf, but safe)
+        leaf = re.sub(r"\[\d+\]", "", leaf)
+        return leaf or raw_param
+
+    if ftype in ("GET", "POST", "COOKIE") and "[" in raw_param and raw_param.endswith("]"):
+        return raw_param.split("[", 1)[0]
+
+    return raw_param
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Super Simple SQLi Detection Tool - Error-based SQLi scanner',
+        description='simple-sqli-scanner.py - Error-heuristic SQLi scanner (500 -> non-500)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Scope:
-  (default)           Test GET + POST params only
-  -c, --cookie-only   Test COOKIE params ONLY
-  -f, --full          Test GET + POST + COOKIE together
-                      + also tests headers: User-Agent, Referer, X-Forwarded-For
-
 Modes:
-  -sr, --singleRecursive  Default mode (tests params one by one)
+  -sr, --singleRecursive  Default mode (tests inputs one by one)
   -faster                 Batch test, fallback to single if 500
   -fastest                Fastest mode with minimal requests
 
+Request file (-r):
+  - Supports raw Burp request(s) or curl commands.
+  - If multiple raw requests are in one file, separate them with TWO empty lines.
+
+Scopes:
+  Default: tests GET + POST/JSON params
+  -c, --cookie-only: ONLY test cookie parameters
+  -f, --full: test params + cookies + header probes (User-Agent/Referer/X-Forwarded-For)
+
+JSON:
+  Auto-detect JSON by Content-Type or by parsing body.
+  -json forces JSON mode (treat body as JSON when possible).
+
 Examples:
-  python3 simple-sqli-detector.py -r packet.txt
-  python3 simple-sqli-detector.py -r packet.txt --proxy http://127.0.0.1:8080
-  python3 simple-sqli-detector.py -r packet.txt -c                    # cookie-only
-  python3 simple-sqli-detector.py -r packet.txt -f                    # full (params + cookies + headers)
-  python3 simple-sqli-detector.py -r packet.txt -fastest -f
+  python3 simple-sqli-scanner.py -r packet.txt
+  python3 simple-sqli-scanner.py -r multi-requests.txt -f
+  python3 simple-sqli-scanner.py -r packet.txt -c
+  python3 simple-sqli-scanner.py -u "https://example.com/page?id=1"
+  python3 simple-sqli-scanner.py -ul urls.txt -t 10
+  python3 simple-sqli-scanner.py -r packet.txt --proxy http://127.0.0.1:8080
+  python3 simple-sqli-scanner.py -r packet.txt -json
         """
     )
 
@@ -1009,21 +1140,18 @@ Examples:
 
     # Scope options
     scope_group = parser.add_mutually_exclusive_group()
-    scope_group.add_argument('-c', '--cookie-only', action='store_true',
-                             help='Test COOKIE parameters ONLY (skip GET/POST)')
-    scope_group.add_argument('-f', '--full', action='store_true',
-                             help='Test GET+POST+COOKIE together + header tests')
+    scope_group.add_argument('-c', '--cookie-only', action='store_true', help='ONLY test cookie parameters')
+    scope_group.add_argument('-f', '--full', action='store_true', help='Test params + cookies + header probes')
 
     # Other options
     parser.add_argument('--debug', action='store_true', help='Debug mode')
     parser.add_argument('--proxy', help='Proxy URL (e.g., http://127.0.0.1:8080)')
-    parser.add_argument('-t', '--threads', type=int, help='Number of threads (default: 1 for single URL, 5 for -ul)')
-
-    # Optional legacy switch: force JSON mode even if not detected
-    parser.add_argument('-json', action='store_true', help='FORCE JSON body mode (otherwise auto-detected)')
+    parser.add_argument('-t', '--threads', type=int, help='Number of threads (default: 1 for single URL/request, 5 for -ul)')
+    parser.add_argument('-json', action='store_true', help='Force JSON mode (treat request body as JSON when possible)')
 
     args = parser.parse_args()
 
+    # Determine mode
     if args.fastest:
         mode = 'fastest'
     elif args.faster:
@@ -1031,19 +1159,13 @@ Examples:
     else:
         mode = 'single'
 
+    # Determine threads
     if args.threads:
         threads = args.threads
     elif args.url_list:
         threads = 5
     else:
         threads = 1
-
-    if args.full:
-        scope = 'full'
-    elif args.cookie_only:
-        scope = 'cookie'
-    else:
-        scope = 'params'
 
     # Prepare requests
     requests: List[str] = []
@@ -1052,12 +1174,7 @@ Examples:
         try:
             with open(args.request, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
-
-            if content.lstrip().startswith("curl"):
-                requests = [content.strip()]
-            else:
-                requests = split_requests(content)
-
+            requests = split_requests(content)
         except Exception as e:
             print(f"Error reading file: {e}", file=sys.stderr)
             sys.exit(1)
@@ -1079,8 +1196,8 @@ Examples:
         sys.exit(1)
 
     print(f"\n{'='*70}")
-    print("SQLi Detection Scanner")
-    print(f"Mode: {mode.upper()} | Scope: {scope.upper()} | Threads: {threads} | Requests: {len(requests)}")
+    print("SQLi Detection Scanner (heuristic)")
+    print(f"Mode: {mode.upper()} | Threads: {threads} | Requests: {len(requests)} | Scope: {'COOKIE-ONLY' if args.cookie_only else ('FULL' if args.full else 'PARAMS')}")
     print(f"{'='*70}")
 
     detector = SQLiDetector(
@@ -1088,11 +1205,12 @@ Examples:
         proxy=args.proxy,
         max_workers=threads,
         mode=mode,
-        scope=scope,
+        cookie_only=args.cookie_only,
+        full_mode=args.full,
         force_json=args.json
     )
 
-    all_findings: List[Dict] = []
+    all_findings: List[Dict[str, Any]] = []
 
     for idx, req in enumerate(requests, 1):
         print(f"\n[{idx}/{len(requests)}] Scanning...")
@@ -1100,36 +1218,67 @@ Examples:
         if findings:
             all_findings.extend(findings)
 
+    # Final report
     if all_findings:
         print(f"\n\n{'='*70}")
-        print(f"⚠️  PROBABLE VULNERABILITY REPORT - {len(all_findings)} FINDING(S)")
+        print(f"⚠️  PROBABLE SQLi SIGNAL(S) FOUND - {len(all_findings)} HIT(S)")
         print(f"{'='*70}\n")
 
-        by_url: Dict[str, List[Dict]] = {}
+        # Group by URL + build a "hit summary" index (easy-to-read keys/params)
+        by_url: Dict[str, List[Dict[str, Any]]] = {}
+        hit_summary: Dict[str, Dict[str, set]] = {}
+
         for finding in all_findings:
-            by_url.setdefault(finding.get('url', 'Unknown'), []).append(finding)
+            url = finding.get('url', 'Unknown')
+            by_url.setdefault(url, []).append(finding)
+
+            ftype = finding.get('type', 'Unknown')
+            raw_param = finding.get('param', 'Unknown')
+
+            key_name = _display_hit_name(ftype, raw_param) 
+
+            hit_summary.setdefault(url, {}).setdefault(ftype, set()).add(key_name)
+
+        # ✅ TOP SUMMARY (easy-to-read keys/params)
+        print("HIT SUMMARY (inputs matching 500 → non-500 pattern):\n")
+        for url in sorted(hit_summary.keys()):
+            print(f"URL: {url}")
+            for ftype in sorted(hit_summary[url].keys()):
+                # show ONLY leaf/key names in red for visibility
+                keys = ", ".join(sorted(f"{RED}{k}{NC}" for k in hit_summary[url][ftype]))
+                print(f"  {ftype}: {keys}")
+            print()
+
+
+        # Existing detailed grouped report (kept)
+        print(f"{'='*70}")
+        print("DETAILS (per-hit entries)")
+        print(f"{'='*70}\n")
 
         for url, findings in by_url.items():
             print(f"URL: {url}")
-            print(f"Highly probable vulnerable parameters: {len(findings)}")
+            print(f"Probable vulnerable inputs: {len(findings)}")
             for finding in findings:
                 print(f"  • {finding['param']} ({finding['type']}) - baseline={finding['baseline']}, quote={finding['quote']}, doublequote={finding['dquote']}")
             print()
 
+        # Detailed commands
         print(f"{'='*70}")
-        print("DETAILED REPRODUCTION COMMANDS (HEURISTIC)")
+        print("DETAILED REPRODUCTION COMMANDS")
         print(f"{'='*70}\n")
 
         for idx, finding in enumerate(all_findings, 1):
-            print(f"[{idx}] {finding['param']} at {finding.get('url', 'Unknown')}")
-            print("Single quote probe (triggers 500):")
+            print(f"[{idx}] {finding['param']} ({finding['type']}) at {finding.get('url', 'Unknown')}")
+            print("Single quote (triggers 500):")
             print(f"{finding['quote_cmd']}\n")
-            print("Two single quotes probe (fixes error):")
+            print("Double quote (removes 500):")
             print(f"{finding['dquote_cmd']}\n")
     else:
         print(f"\n{'='*70}")
-        print("✓ No SQL injection vulnerabilities detected")
+        print("✓ No SQLi signals detected (heuristic)")
         print(f"{'='*70}\n")
+
+
 
 
 if __name__ == '__main__':
